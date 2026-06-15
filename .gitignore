@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+
+# Generated trace/log outputs
+meshtrain/core/logging/*.jsonl
+tmp/
