@@ -21,6 +21,8 @@ from meshtrain.data.packing import CausalLMPacker
 from meshtrain.data.sampler import DPSampler
 from meshtrain.model.standard_transformer import TransformerConfig, TransformerLM
 from meshtrain.parallelism.data_parallel import (
+    BucketedDataParallel,
+    BucketedDPConfig,
     broadcast_parameters,
     check_replicas_match,
     sync_gradients,
@@ -48,6 +50,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--atol", type=float, default=1e-5)
+    parser.add_argument(
+        "--dp-mode",
+        choices=["simple", "bucketed-sync", "bucketed-async", "bucketed-overlap"],
+        default="simple",
+    )
+    parser.add_argument("--bucket-size-mb", type=int, default=25)
     return parser.parse_args()
 
 
@@ -125,9 +133,12 @@ def real_dp_step(
     optimizer: torch.optim.Optimizer,
     batch,
     groups,
+    reducer: BucketedDataParallel | None,
 ) -> torch.Tensor:
     model.train()
     optimizer.zero_grad(set_to_none=True)
+    if reducer is not None:
+        reducer.prepare_for_backward()
 
     logits = model(batch.input_ids)
     loss_out = next_token_loss(logits, batch.target_ids)
@@ -136,10 +147,31 @@ def real_dp_step(
     backward_loss = loss_out.loss_sum / global_stats.num_tokens.clamp_min(1)
     backward_loss.backward()
 
-    sync_gradients(model, groups)
+    if reducer is None:
+        sync_gradients(model, groups)
+    else:
+        reducer.sync_gradients()
+        reducer.finalize_backward()
+
     optimizer.step()
 
     return global_stats.loss.detach()
+
+
+def build_bucketed_reducer(
+    args: argparse.Namespace,
+    model: TransformerLM,
+    groups,
+) -> BucketedDataParallel | None:
+    if args.dp_mode == "simple":
+        return None
+
+    config = BucketedDPConfig(
+        bucket_size_mb=args.bucket_size_mb,
+        async_all_reduce=args.dp_mode in {"bucketed-async", "bucketed-overlap"},
+        overlap_backward=args.dp_mode == "bucketed-overlap",
+    )
+    return BucketedDataParallel(model=model, groups=groups, config=config)
 
 
 def max_diff_from_reference(
@@ -189,7 +221,11 @@ def main() -> None:
 
         torch.manual_seed(args.seed)
         model = build_model(args, runtime.device)
-        broadcast_parameters(model, groups)
+        reducer = build_bucketed_reducer(args, model, groups)
+        if reducer is None:
+            broadcast_parameters(model, groups)
+        else:
+            reducer.broadcast_parameters()
 
         initial_state = copy.deepcopy(model.state_dict()) if runtime.rank == 0 else None
         train_config = build_train_config(args, runtime.device)
@@ -226,8 +262,12 @@ def main() -> None:
                 reference_batch,
             )
 
-        dp_loss = real_dp_step(model, optimizer, local_batch, groups)
-        replica_check = check_replicas_match(model, groups, atol=args.atol)
+        dp_loss = real_dp_step(model, optimizer, local_batch, groups, reducer)
+        replica_check = (
+            check_replicas_match(model, groups, atol=args.atol)
+            if reducer is None
+            else reducer.check_replicas_match(atol=args.atol)
+        )
         reference_diff = max_diff_from_reference(
             model,
             reference_model,
@@ -244,6 +284,7 @@ def main() -> None:
         for rank in range(runtime.world_size):
             if runtime.rank == rank:
                 print(f"rank={runtime.rank}")
+                print(f"  dp_mode={args.dp_mode}")
                 print(f"  sample_ids={local_batch.sample_ids.tolist()}")
                 print(f"  local_batch_range={local_batch.local_batch_range}")
                 print(f"  dp_global_loss={float(dp_loss)}")
