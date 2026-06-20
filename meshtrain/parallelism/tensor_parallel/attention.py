@@ -101,7 +101,36 @@ class TensorParallelSelfAttention(nn.Module):
            
     @torch.no_grad()
     def load_from_attention(self, attention: nn.Module) -> None:
-        self.qkv.load_from_linear(attention.qkv)
+        tp_rank = _tp_rank(self.groups)
+        start = tp_rank * self.local_dim
+        end = start + self.local_dim
+
+        q_weight, k_weight, v_weight = attention.qkv.weight.chunk(3, dim=0)
+        local_qkv_weight = torch.cat(
+            [
+                q_weight[start:end, :],
+                k_weight[start:end, :],
+                v_weight[start:end, :],
+            ],
+            dim=0,
+        )
+        self.qkv.weight.copy_(local_qkv_weight)
+
+        if self.qkv.bias is not None:
+            if attention.qkv.bias is None:
+                raise ValueError("source attention qkv has no bias")
+
+            q_bias, k_bias, v_bias = attention.qkv.bias.chunk(3, dim=0)
+            local_qkv_bias = torch.cat(
+                [
+                    q_bias[start:end],
+                    k_bias[start:end],
+                    v_bias[start:end],
+                ],
+                dim=0,
+            )
+            self.qkv.bias.copy_(local_qkv_bias)
+
         self.out_proj.load_from_linear(attention.out_proj)
         
            
