@@ -8,6 +8,10 @@ import torch.nn as nn
 
 from meshtrain.core.distributed.groups import ParallelGroups
 from meshtrain.core.distributed.placement import split_range
+from meshtrain.model.standard_transformer import TransformerBlock, TransformerConfig
+from meshtrain.parallelism.tensor_parallel.transformer import (
+    TensorParallelTransformerBlock,
+)
 from meshtrain.parallelism.pipeline_parallel.p2p import (
     pipeline_prev_rank,
     pipeline_next_rank,
@@ -134,6 +138,102 @@ class PipelineStage(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor: 
         return self.forward_local(x)  
 
+
+class TransformerPipelineStage(PipelineStage):
+    def __init__(
+        self,
+        config: TransformerConfig,
+        groups: ParallelGroups,
+        *,
+        layer_start: int,
+        layer_end: int,
+    ):
+        if config.tie_embeddings and len(groups.pp_ranks) > 1:
+            raise ValueError(
+                "pipeline-parallel TransformerPipelineStage requires "
+                "tie_embeddings=False for now"
+            )
+
+        block_cls = (
+            TensorParallelTransformerBlock
+            if len(groups.tp_ranks) > 1
+            else TransformerBlock
+        )
+        local_layers = [
+            block_cls(config, groups) if block_cls is TensorParallelTransformerBlock else block_cls(config)
+            for _ in range(layer_end - layer_start)
+        ]
+
+        super().__init__(
+            local_layers,
+            groups,
+            layer_start=layer_start,
+            layer_end=layer_end,
+        )
+
+        self.config = config
+
+        self.token_emb = (
+            nn.Embedding(config.vocab_size, config.dim)
+            if self.is_first
+            else None
+        )
+        self.position_emb = (
+            nn.Embedding(config.seq_len, config.dim)
+            if self.is_first
+            else None
+        )
+        self.norm = (
+            nn.RMSNorm(config.dim, eps=config.norm_eps)
+            if self.is_last
+            else None
+        )
+        self.lm_head = (
+            nn.Linear(config.dim, config.vocab_size, bias=False)
+            if self.is_last
+            else None
+        )
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward_local(self, x: torch.Tensor) -> torch.Tensor:
+        if self.is_first:
+            if x.ndim != 2:
+                raise ValueError(
+                    "first transformer pipeline stage expects input_ids [B, T]"
+                )
+
+            batch, seq_len = x.shape
+            if seq_len > self.config.seq_len:
+                raise ValueError(
+                    f"input seq_len {seq_len} exceeds model seq_len {self.config.seq_len}"
+                )
+
+            assert self.token_emb is not None
+            assert self.position_emb is not None
+
+            positions = torch.arange(seq_len, device=x.device)
+            x = self.token_emb(x) + self.position_emb(positions)[None, :, :]
+
+        for layer in self.layers:
+            x = layer(x)
+
+        if self.is_last:
+            assert self.norm is not None
+            assert self.lm_head is not None
+            x = self.norm(x)
+            x = self.lm_head(x)
+
+        return x
+
       
 
 def build_pipeline_stage_from_layers(
@@ -158,6 +258,28 @@ def build_pipeline_stage_from_layers(
         groups, 
         layer_start=layer_range.start, 
         layer_end=layer_range.end, 
+    )
+
+
+def build_transformer_pipeline_stage(
+    config: TransformerConfig,
+    groups: ParallelGroups,
+) -> TransformerPipelineStage:
+    stage_index = groups.pp_ranks.index(groups.rank)
+    num_stages = len(groups.pp_ranks)
+
+    layer_range = split_range(
+        size=config.n_layers,
+        parts=num_stages,
+        index=stage_index,
+        require_even=False,
+    )
+
+    return TransformerPipelineStage(
+        config,
+        groups,
+        layer_start=layer_range.start,
+        layer_end=layer_range.end,
     )
 
 
