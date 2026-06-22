@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 from pathlib import Path
 
@@ -61,8 +62,10 @@ def parse_args() -> argparse.Namespace:
 
 
 def mode_dims(args: argparse.Namespace) -> tuple[int, int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
     if args.mode == "dp":
-        return args.dp or 2, args.pp or 1, args.tp or 1
+        return args.dp or world_size, args.pp or 1, args.tp or 1
     if args.mode == "dp-pp":
         return args.dp or 2, args.pp or 2, args.tp or 1
     if args.mode == "pp-tp":
