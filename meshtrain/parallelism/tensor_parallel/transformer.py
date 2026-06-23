@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -7,6 +9,19 @@ from meshtrain.core.distributed.groups import ParallelGroups
 from meshtrain.model.standard_transformer import TransformerConfig, TransformerLM
 from meshtrain.parallelism.tensor_parallel.attention import TensorParallelSelfAttention
 from meshtrain.parallelism.tensor_parallel.mlp import TensorParallelMLP
+
+
+def _debug_tp(groups: ParallelGroups, message: str) -> None:
+    if os.environ.get("MESHTRAIN_TP_DEBUG", "0") != "1":
+        return
+
+    if os.environ.get("MESHTRAIN_TP_SYNC_DEBUG", "0") == "1" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    print(
+        f"rank={groups.rank} tp_group={groups.tp_ranks} tp_transformer:{message}",
+        flush=True,
+    )
 
 
 class TensorParallelTransformerBlock(nn.Module):
@@ -17,6 +32,7 @@ class TensorParallelTransformerBlock(nn.Module):
     ):
         super().__init__()
 
+        self.groups = groups
         self.attn_norm = nn.RMSNorm(config.dim, eps=config.norm_eps)
         self.attn = TensorParallelSelfAttention(
             dim=config.dim,
@@ -34,8 +50,29 @@ class TensorParallelTransformerBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.mlp(self.mlp_norm(x))
+        _debug_tp(self.groups, "block:attn_norm_start")
+        attn_input = self.attn_norm(x)
+        _debug_tp(self.groups, "block:attn_norm_done")
+
+        _debug_tp(self.groups, "block:attn_start")
+        attn_output = self.attn(attn_input)
+        _debug_tp(self.groups, "block:attn_done")
+
+        _debug_tp(self.groups, "block:attn_residual_start")
+        x = x + attn_output
+        _debug_tp(self.groups, "block:attn_residual_done")
+
+        _debug_tp(self.groups, "block:mlp_norm_start")
+        mlp_input = self.mlp_norm(x)
+        _debug_tp(self.groups, "block:mlp_norm_done")
+
+        _debug_tp(self.groups, "block:mlp_start")
+        mlp_output = self.mlp(mlp_input)
+        _debug_tp(self.groups, "block:mlp_done")
+
+        _debug_tp(self.groups, "block:mlp_residual_start")
+        x = x + mlp_output
+        _debug_tp(self.groups, "block:mlp_residual_done")
         return x
 
     @torch.no_grad()
@@ -89,6 +126,7 @@ class TensorParallelTransformerLM(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        _debug_tp(self.groups, f"lm:forward_start shape={tuple(input_ids.shape)}")
         batch, seq_len = input_ids.shape
         if seq_len > self.config.seq_len:
             raise ValueError(
@@ -96,13 +134,20 @@ class TensorParallelTransformerLM(nn.Module):
             )
 
         positions = torch.arange(seq_len, device=input_ids.device)
+        _debug_tp(self.groups, "lm:embedding_start")
         x = self.token_emb(input_ids) + self.position_emb(positions)[None, :, :]
+        _debug_tp(self.groups, f"lm:embedding_done shape={tuple(x.shape)}")
 
-        for block in self.blocks:
+        for block_index, block in enumerate(self.blocks):
+            _debug_tp(self.groups, f"lm:block_{block_index}_start")
             x = block(x)
+            _debug_tp(self.groups, f"lm:block_{block_index}_done")
 
+        _debug_tp(self.groups, "lm:head_start")
         x = self.norm(x)
-        return self.lm_head(x)
+        output = self.lm_head(x)
+        _debug_tp(self.groups, f"lm:head_done shape={tuple(output.shape)}")
+        return output
 
     @torch.no_grad()
     def load_from_transformer_lm(self, model: TransformerLM) -> None:
