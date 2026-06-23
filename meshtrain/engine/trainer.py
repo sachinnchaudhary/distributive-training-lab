@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 
 import torch
@@ -90,6 +91,12 @@ class EngineTrainer:
             raise RuntimeError("model has not been built")
         return self.model
 
+    def _debug_step(self, message: str) -> None:
+        if os.environ.get("MESHTRAIN_ENGINE_DEBUG", "0") != "1":
+            return
+        rank = "?" if self.context is None else self.context.runtime.rank
+        print(f"rank={rank} engine:{message}", flush=True)
+
     def _validate_supported_parallelism(self) -> None:
         parallelism = self.config.parallelism
 
@@ -106,15 +113,7 @@ class EngineTrainer:
         if parallelism.fsdp:
             raise NotImplementedError("FSDP is not wired into EngineTrainer yet")
 
-        if parallelism.pp > 1:
-            if parallelism.pp_schedule != "gpipe":
-                raise NotImplementedError("EngineTrainer supports only GPipe PP first")
-            if self.config.model.tie_embeddings:
-                raise ValueError("PP training requires model.tie_embeddings=False for now")
-            if self.config.activation_checkpointing.enabled:
-                raise NotImplementedError(
-                    "activation checkpointing for PP stages is not wired yet"
-                )
+        
 
     def setup(self) -> None:
         if self.context is not None:
@@ -257,36 +256,52 @@ class EngineTrainer:
 
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
+        self._debug_step("single:zero_grad_done")
 
         batch = self.dataloader.get_batch(self.state.global_batch_id)
+        self._debug_step("single:batch_done")
 
         with autocast_context(
             self.config.precision,
             device=self.context.runtime.device,
         ):
+            self._debug_step("single:forward_start")
             logits = self.model(batch.input_ids)
+            self._debug_step("single:forward_done")
             loss_out = next_token_loss(logits, batch.target_ids)
+            self._debug_step("single:loss_done")
 
+        self._debug_step("single:loss_stats_sync_start")
         global_stats = sync_loss_stats(
             loss_out.loss_sum,
             loss_out.num_tokens,
             self.context.groups,
         )
+        self._debug_step("single:loss_stats_sync_done")
         backward_loss = loss_out.loss_sum / global_stats.num_tokens.clamp_min(1)
 
         if self.scaler is not None:
+            self._debug_step("single:backward_start")
             self.scaler.scale(backward_loss).backward()
+            self._debug_step("single:backward_done")
             self.scaler.unscale_(self.optimizer)
         else:
+            self._debug_step("single:backward_start")
             backward_loss.backward()
+            self._debug_step("single:backward_done")
 
+        self._debug_step("single:grad_sync_start")
         sync_gradients(self.model, self.context.groups)
+        self._debug_step("single:grad_sync_done")
 
         if self.scaler is not None:
+            self._debug_step("single:optimizer_start")
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
+            self._debug_step("single:optimizer_start")
             self.optimizer.step()
+        self._debug_step("single:optimizer_done")
 
         metrics = TrainMetrics(
             step=self.state.step,
@@ -310,8 +325,10 @@ class EngineTrainer:
         stage = self.pipeline_stage
         stage.train()
         self.optimizer.zero_grad(set_to_none=True)
+        self._debug_step("pipeline:zero_grad_done")
 
         batch = self.dataloader.get_batch(self.state.global_batch_id)
+        self._debug_step("pipeline:batch_done")
         num_microbatches = self._num_microbatches()
         input_microbatches = list(batch.input_ids.chunk(num_microbatches, dim=0))
         target_microbatches = list(batch.target_ids.chunk(num_microbatches, dim=0))
@@ -331,6 +348,7 @@ class EngineTrainer:
             self.config.precision,
             device=self.context.runtime.device,
         ):
+            self._debug_step("pipeline:gpipe_start")
             losses = gpipe_forward_backward(
                 stage,
                 input_microbatches if stage.is_first else None,
@@ -340,9 +358,14 @@ class EngineTrainer:
                 device=self.context.runtime.device,
                 loss_fn=loss_fn if stage.is_last else None,
             )
+            self._debug_step("pipeline:gpipe_done")
 
+        self._debug_step("pipeline:grad_sync_start")
         sync_gradients(stage, self.context.groups)
+        self._debug_step("pipeline:grad_sync_done")
+        self._debug_step("pipeline:optimizer_start")
         self.optimizer.step()
+        self._debug_step("pipeline:optimizer_done")
 
         loss_tensor = torch.zeros((), device=self.context.runtime.device)
         token_tensor = torch.zeros((), device=self.context.runtime.device, dtype=torch.long)
@@ -356,8 +379,10 @@ class EngineTrainer:
             )
 
         if self.context.runtime.is_distributed:
+            self._debug_step("pipeline:loss_reduce_start")
             dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM)
             dist.all_reduce(token_tensor, op=dist.ReduceOp.SUM)
+            self._debug_step("pipeline:loss_reduce_done")
 
         num_tokens = int(token_tensor.detach().cpu())
         loss = float(loss_tensor.detach().cpu()) / self.config.parallelism.dp
