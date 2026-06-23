@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 
 import torch
 import torch.distributed as dist
@@ -61,6 +62,12 @@ def _ep_rank(groups: ParallelGroups) -> int:
 
 def _ep_is_active(groups: ParallelGroups) -> bool:
     return groups.ep_group is not None and len(groups.ep_ranks) > 1
+
+
+def _debug_ep(groups: ParallelGroups, message: str) -> None:
+    if os.environ.get("MESHTRAIN_5D_DEBUG", "0") != "1":
+        return
+    print(f"rank={groups.rank} ep_group={groups.ep_ranks} ep:{message}", flush=True)
 
 
 def expert_parallel_range(
@@ -173,11 +180,13 @@ def _exchange_counts(
     recv_counts = torch.empty_like(send_counts)
 
     if _ep_is_active(groups):
+        _debug_ep(groups, f"count_all_to_all_start send={send_counts.tolist()}")
         dist.all_to_all_single(
             recv_counts,
             send_counts,
             group=groups.ep_group,
         )
+        _debug_ep(groups, f"count_all_to_all_done recv={recv_counts.tolist()}")
     else:
         recv_counts.copy_(send_counts)
 
@@ -191,6 +200,12 @@ def _all_to_all_by_counts(
     groups: ParallelGroups,
 ) -> torch.Tensor:
     if send_tensor.requires_grad and send_tensor.is_floating_point():
+        _debug_ep(
+            groups,
+            "tensor_all_to_all_autograd_start "
+            f"shape={tuple(send_tensor.shape)} send={send_counts.tolist()} "
+            f"recv={recv_counts.tolist()}",
+        )
         return _AllToAllByCounts.apply(
             send_tensor,
             tuple(send_counts.tolist()),
@@ -207,6 +222,12 @@ def _all_to_all_by_counts(
     )
 
     if _ep_is_active(groups):
+        _debug_ep(
+            groups,
+            "tensor_all_to_all_start "
+            f"shape={tuple(send_tensor.shape)} send={send_counts.tolist()} "
+            f"recv={recv_counts.tolist()}",
+        )
         dist.all_to_all_single(
             recv_tensor,
             send_tensor.contiguous(),
@@ -214,6 +235,7 @@ def _all_to_all_by_counts(
             input_split_sizes=send_counts.tolist(),
             group=groups.ep_group,
         )
+        _debug_ep(groups, f"tensor_all_to_all_done out={tuple(recv_tensor.shape)}")
     else:
         recv_tensor.copy_(send_tensor)
 

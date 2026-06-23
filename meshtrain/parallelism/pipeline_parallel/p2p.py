@@ -1,5 +1,7 @@
 from __future__ import annotations  
 
+import os
+
 import torch  
 import torch.distributed as dist  
 
@@ -17,6 +19,12 @@ def _pp_group(groups: ParallelGroups) -> dist.ProcessGroup | None:
 
 def _pp_group_rank(groups: ParallelGroups, rank: int) -> int:
     return groups.pp_ranks.index(rank)
+
+
+def _debug_p2p(groups: ParallelGroups, message: str) -> None:
+    if os.environ.get("MESHTRAIN_5D_DEBUG", "0") != "1":
+        return
+    print(f"rank={groups.rank} pp_group={groups.pp_ranks} pp:{message}", flush=True)
 
 
 
@@ -56,12 +64,14 @@ def send_forward(tensor: torch.Tensor, groups: ParallelGroups) -> None:
     if dst is None:  
         return  
     
+    _debug_p2p(groups, f"send_forward_start dst={dst} shape={tuple(tensor.shape)}")
     work = dist.isend(
         tensor.contiguous(),
         group=_pp_group(groups),
         group_dst=_pp_group_rank(groups, dst),
     )  
     work.wait()
+    _debug_p2p(groups, "send_forward_done")
 
 def recv_forward(
         shape: tuple[int, ...], 
@@ -77,12 +87,14 @@ def recv_forward(
         raise RuntimeError("first pipeline stage cannot receive forward activation") 
     
     tensor = torch.empty(shape, device=device, dtype=dtype)  
+    _debug_p2p(groups, f"recv_forward_start src={src} shape={shape}")
     work = dist.irecv(
         tensor,
         group=_pp_group(groups),
         group_src=_pp_group_rank(groups, src),
     )  
     work.wait()
+    _debug_p2p(groups, "recv_forward_done")
 
     return tensor  
 
@@ -95,12 +107,14 @@ def send_backward(tensor_grad: torch.Tensor, groups: ParallelGroups) -> None:
     if dst is None:  
         return  
     
+    _debug_p2p(groups, f"send_backward_start dst={dst} shape={tuple(tensor_grad.shape)}")
     work = dist.isend(
         tensor_grad.contiguous(),
         group=_pp_group(groups),
         group_dst=_pp_group_rank(groups, dst),
     ) 
     work.wait()
+    _debug_p2p(groups, "send_backward_done")
 
 def recv_backward( 
     shape: tuple[int, ...], 
@@ -116,12 +130,14 @@ def recv_backward(
         raise RuntimeError("last pipeline stage cannot receive backward activation gradient")  
     
     tensor_grad = torch.empty(shape, device=device, dtype=dtype)  
+    _debug_p2p(groups, f"recv_backward_start src={src} shape={shape}")
     work = dist.irecv(
         tensor_grad,
         group=_pp_group(groups),
         group_src=_pp_group_rank(groups, src),
     )  
     work.wait()
+    _debug_p2p(groups, "recv_backward_done")
 
     return tensor_grad  
 
