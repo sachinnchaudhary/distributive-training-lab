@@ -33,6 +33,10 @@ def _cp_rank(groups: ParallelGroups) -> int:
 def _cp_is_active(groups: ParallelGroups) -> bool:
     return groups.cp_group is not None and len(groups.cp_ranks) > 1  
 
+
+def _cp_group_rank(groups: ParallelGroups, rank: int) -> int:
+    return groups.cp_ranks.index(rank)
+
 def _normalize_dim(dim: int, ndim: int) -> int:  
     if ndim == 0:
         raise ValueError("cannot index a scalar tensor")
@@ -176,10 +180,30 @@ def _exchange_kv_block(
      recv_v = torch.empty_like(v_block)  
 
      ops = [  
-         dist.P2POp(dist.isend, k_block, send_rank),  
-         dist.P2POp(dist.isend, v_block, send_rank), 
-         dist.P2POp(dist.irecv, recv_k, recv_rank), 
-         dist.P2POp(dist.irecv, recv_v, recv_rank), 
+         dist.P2POp(
+             dist.isend,
+             k_block,
+             group=groups.cp_group,
+             group_peer=_cp_group_rank(groups, send_rank),
+         ),  
+         dist.P2POp(
+             dist.isend,
+             v_block,
+             group=groups.cp_group,
+             group_peer=_cp_group_rank(groups, send_rank),
+         ), 
+         dist.P2POp(
+             dist.irecv,
+             recv_k,
+             group=groups.cp_group,
+             group_peer=_cp_group_rank(groups, recv_rank),
+         ), 
+         dist.P2POp(
+             dist.irecv,
+             recv_v,
+             group=groups.cp_group,
+             group_peer=_cp_group_rank(groups, recv_rank),
+         ), 
      ]       
      
      works = dist.batch_isend_irecv(ops)  
