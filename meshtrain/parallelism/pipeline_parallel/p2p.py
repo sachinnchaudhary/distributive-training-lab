@@ -11,6 +11,10 @@ def _pp_is_active(groups: ParallelGroups) -> bool:
     return groups.pp_group is not None and len(groups.pp_ranks) > 1  
 
 
+def _pp_group(groups: ParallelGroups) -> dist.ProcessGroup | None:
+    return groups.pp_group if _pp_is_active(groups) else None
+
+
 
 def pipeline_prev_rank(groups: ParallelGroups) -> int | None:  
 
@@ -48,7 +52,7 @@ def send_forward(tensor: torch.Tensor, groups: ParallelGroups) -> None:
     if dst is None:  
         return  
     
-    work = dist.isend(tensor.contiguous(), dst=dst)  
+    work = dist.isend(tensor.contiguous(), dst=dst, group=_pp_group(groups))  
     work.wait()
 
 def recv_forward(
@@ -65,7 +69,7 @@ def recv_forward(
         raise RuntimeError("first pipeline stage cannot receive forward activation") 
     
     tensor = torch.empty(shape, device=device, dtype=dtype)  
-    work = dist.irecv(tensor, src=src)  
+    work = dist.irecv(tensor, src=src, group=_pp_group(groups))  
     work.wait()
 
     return tensor  
@@ -79,7 +83,7 @@ def send_backward(tensor_grad: torch.Tensor, groups: ParallelGroups) -> None:
     if dst is None:  
         return  
     
-    work = dist.isend(tensor_grad.contiguous(), dst=dst) 
+    work = dist.isend(tensor_grad.contiguous(), dst=dst, group=_pp_group(groups)) 
     work.wait()
 
 def recv_backward( 
@@ -96,7 +100,7 @@ def recv_backward(
         raise RuntimeError("last pipeline stage cannot receive backward activation gradient")  
     
     tensor_grad = torch.empty(shape, device=device, dtype=dtype)  
-    work = dist.irecv(tensor_grad, src=src)  
+    work = dist.irecv(tensor_grad, src=src, group=_pp_group(groups))  
     work.wait()
 
     return tensor_grad  
@@ -187,7 +191,7 @@ def send_virtual_forward(
     if dst is None:
         return
 
-    work = dist.isend(tensor.contiguous(), dst=dst)
+    work = dist.isend(tensor.contiguous(), dst=dst, group=_pp_group(groups))
     work.wait()
 
 
@@ -210,7 +214,7 @@ def recv_virtual_forward(
         )
 
     tensor = torch.empty(shape, device=device, dtype=dtype)
-    work = dist.irecv(tensor, src=src)
+    work = dist.irecv(tensor, src=src, group=_pp_group(groups))
     work.wait()
 
     return tensor  
@@ -230,7 +234,7 @@ def send_virtual_backward(
     if dst is None:
         return
 
-    work = dist.isend(tensor_grad.contiguous(), dst=dst)
+    work = dist.isend(tensor_grad.contiguous(), dst=dst, group=_pp_group(groups))
     work.wait()
 
 
@@ -255,7 +259,7 @@ def recv_virtual_backward(
         )
 
     tensor_grad = torch.empty(shape, device=device, dtype=dtype)
-    work = dist.irecv(tensor_grad, src=src)
+    work = dist.irecv(tensor_grad, src=src, group=_pp_group(groups))
     work.wait()
 
     return tensor_grad
