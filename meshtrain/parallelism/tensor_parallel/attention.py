@@ -1,5 +1,7 @@
 from __future__ import annotations 
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +25,20 @@ def _require_divisible(value: int, parts: int, name: str) -> None:
     if parts < 1:
         raise ValueError(f"parts must be at least 1, got {parts}")
     if value % parts != 0:
-        raise ValueError(f"{name}={value} must be divisible by tp_size={parts}")  
+            raise ValueError(f"{name}={value} must be divisible by tp_size={parts}")  
+
+
+def _debug_tp(groups: ParallelGroups, message: str) -> None:
+    if os.environ.get("MESHTRAIN_TP_DEBUG", "0") != "1":
+        return
+
+    if os.environ.get("MESHTRAIN_TP_SYNC_DEBUG", "0") == "1" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    print(
+        f"rank={groups.rank} tp_group={groups.tp_ranks} tp_attention:{message}",
+        flush=True,
+    )
     
 
 class TensorParallelSelfAttention(nn.Module):  
@@ -70,22 +85,29 @@ class TensorParallelSelfAttention(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _debug_tp(self.groups, f"forward_start shape={tuple(x.shape)}")
         batch, seq_len, dim = x.shape 
 
         if dim != self.dim:
             raise ValueError(f"input dim {dim} does not match attention dim {self.dim}")
             
+        _debug_tp(self.groups, "qkv_start")
         local_qkv = self.qkv(x)
+        _debug_tp(self.groups, f"qkv_done shape={tuple(local_qkv.shape)}")
         q, k, v = local_qkv.chunk(3, dim=-1)
+        _debug_tp(self.groups, "qkv_chunk_done")
 
         q = q.view(batch, seq_len, self.local_heads, self.head_dim)
         k = k.view(batch, seq_len, self.local_heads, self.head_dim)
         v = v.view(batch, seq_len, self.local_heads, self.head_dim)
+        _debug_tp(self.groups, "qkv_view_done")
 
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+        _debug_tp(self.groups, "qkv_transpose_done")
 
+        _debug_tp(self.groups, "sdpa_start")
         attn = F.scaled_dot_product_attention(
             q,
             k,
@@ -93,11 +115,17 @@ class TensorParallelSelfAttention(nn.Module):
             dropout_p=self.dropout if self.training else 0.0,
             is_causal=True,
         )
+        _debug_tp(self.groups, f"sdpa_done shape={tuple(attn.shape)}")
 
         attn = attn.transpose(1, 2).contiguous()
+        _debug_tp(self.groups, f"attn_transpose_done shape={tuple(attn.shape)}")
         attn = attn.view(batch, seq_len, self.local_dim)
+        _debug_tp(self.groups, f"attn_view_done shape={tuple(attn.shape)}")
 
-        return self.out_proj(attn)
+        _debug_tp(self.groups, "out_proj_start")
+        output = self.out_proj(attn)
+        _debug_tp(self.groups, f"out_proj_done shape={tuple(output.shape)}")
+        return output
            
     @torch.no_grad()
     def load_from_attention(self, attention: nn.Module) -> None:
