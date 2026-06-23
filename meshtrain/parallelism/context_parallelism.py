@@ -173,6 +173,9 @@ def _exchange_kv_block(
      if not _cp_is_active(groups):
         return k_block, v_block  
 
+     k_block = k_block.contiguous()
+     v_block = v_block.contiguous()
+
      send_rank = _ring_next_rank(groups)  
      recv_rank = _ring_prev_rank(groups)  
 
