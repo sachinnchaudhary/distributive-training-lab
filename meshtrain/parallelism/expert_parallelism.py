@@ -190,6 +190,15 @@ def _all_to_all_by_counts(
     recv_counts: torch.Tensor,
     groups: ParallelGroups,
 ) -> torch.Tensor:
+    if send_tensor.requires_grad and send_tensor.is_floating_point():
+        return _AllToAllByCounts.apply(
+            send_tensor,
+            tuple(send_counts.tolist()),
+            tuple(recv_counts.tolist()),
+            groups.ep_group,
+            _ep_is_active(groups),
+        )
+
     output_shape = (int(recv_counts.sum().item()), *send_tensor.shape[1:])
     recv_tensor = torch.empty(
         output_shape,
@@ -209,6 +218,64 @@ def _all_to_all_by_counts(
         recv_tensor.copy_(send_tensor)
 
     return recv_tensor
+
+
+class _AllToAllByCounts(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        send_tensor: torch.Tensor,
+        send_counts: tuple[int, ...],
+        recv_counts: tuple[int, ...],
+        group: dist.ProcessGroup | None,
+        active: bool,
+    ) -> torch.Tensor:
+        ctx.send_counts = send_counts
+        ctx.recv_counts = recv_counts
+        ctx.group = group
+        ctx.active = active
+
+        output_shape = (sum(recv_counts), *send_tensor.shape[1:])
+        recv_tensor = torch.empty(
+            output_shape,
+            device=send_tensor.device,
+            dtype=send_tensor.dtype,
+        )
+
+        if active:
+            dist.all_to_all_single(
+                recv_tensor,
+                send_tensor.contiguous(),
+                output_split_sizes=list(recv_counts),
+                input_split_sizes=list(send_counts),
+                group=group,
+            )
+        else:
+            recv_tensor.copy_(send_tensor)
+
+        return recv_tensor
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input_shape = (sum(ctx.send_counts), *grad_output.shape[1:])
+        grad_input = torch.empty(
+            grad_input_shape,
+            device=grad_output.device,
+            dtype=grad_output.dtype,
+        )
+
+        if ctx.active:
+            dist.all_to_all_single(
+                grad_input,
+                grad_output.contiguous(),
+                output_split_sizes=list(ctx.send_counts),
+                input_split_sizes=list(ctx.recv_counts),
+                group=ctx.group,
+            )
+        else:
+            grad_input.copy_(grad_output)
+
+        return grad_input, None, None, None, None
 
 
 def dispatch_tokens_to_experts(
