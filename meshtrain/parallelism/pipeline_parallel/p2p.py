@@ -15,6 +15,10 @@ def _pp_group(groups: ParallelGroups) -> dist.ProcessGroup | None:
     return groups.pp_group if _pp_is_active(groups) else None
 
 
+def _pp_group_rank(groups: ParallelGroups, rank: int) -> int:
+    return groups.pp_ranks.index(rank)
+
+
 
 def pipeline_prev_rank(groups: ParallelGroups) -> int | None:  
 
@@ -52,7 +56,11 @@ def send_forward(tensor: torch.Tensor, groups: ParallelGroups) -> None:
     if dst is None:  
         return  
     
-    work = dist.isend(tensor.contiguous(), dst=dst, group=_pp_group(groups))  
+    work = dist.isend(
+        tensor.contiguous(),
+        group=_pp_group(groups),
+        group_dst=_pp_group_rank(groups, dst),
+    )  
     work.wait()
 
 def recv_forward(
@@ -69,7 +77,11 @@ def recv_forward(
         raise RuntimeError("first pipeline stage cannot receive forward activation") 
     
     tensor = torch.empty(shape, device=device, dtype=dtype)  
-    work = dist.irecv(tensor, src=src, group=_pp_group(groups))  
+    work = dist.irecv(
+        tensor,
+        group=_pp_group(groups),
+        group_src=_pp_group_rank(groups, src),
+    )  
     work.wait()
 
     return tensor  
@@ -83,7 +95,11 @@ def send_backward(tensor_grad: torch.Tensor, groups: ParallelGroups) -> None:
     if dst is None:  
         return  
     
-    work = dist.isend(tensor_grad.contiguous(), dst=dst, group=_pp_group(groups)) 
+    work = dist.isend(
+        tensor_grad.contiguous(),
+        group=_pp_group(groups),
+        group_dst=_pp_group_rank(groups, dst),
+    ) 
     work.wait()
 
 def recv_backward( 
@@ -100,7 +116,11 @@ def recv_backward(
         raise RuntimeError("last pipeline stage cannot receive backward activation gradient")  
     
     tensor_grad = torch.empty(shape, device=device, dtype=dtype)  
-    work = dist.irecv(tensor_grad, src=src, group=_pp_group(groups))  
+    work = dist.irecv(
+        tensor_grad,
+        group=_pp_group(groups),
+        group_src=_pp_group_rank(groups, src),
+    )  
     work.wait()
 
     return tensor_grad  
@@ -191,7 +211,11 @@ def send_virtual_forward(
     if dst is None:
         return
 
-    work = dist.isend(tensor.contiguous(), dst=dst, group=_pp_group(groups))
+    work = dist.isend(
+        tensor.contiguous(),
+        group=_pp_group(groups),
+        group_dst=_pp_group_rank(groups, dst),
+    )
     work.wait()
 
 
@@ -214,7 +238,11 @@ def recv_virtual_forward(
         )
 
     tensor = torch.empty(shape, device=device, dtype=dtype)
-    work = dist.irecv(tensor, src=src, group=_pp_group(groups))
+    work = dist.irecv(
+        tensor,
+        group=_pp_group(groups),
+        group_src=_pp_group_rank(groups, src),
+    )
     work.wait()
 
     return tensor  
@@ -234,7 +262,11 @@ def send_virtual_backward(
     if dst is None:
         return
 
-    work = dist.isend(tensor_grad.contiguous(), dst=dst, group=_pp_group(groups))
+    work = dist.isend(
+        tensor_grad.contiguous(),
+        group=_pp_group(groups),
+        group_dst=_pp_group_rank(groups, dst),
+    )
     work.wait()
 
 
@@ -259,7 +291,11 @@ def recv_virtual_backward(
         )
 
     tensor_grad = torch.empty(shape, device=device, dtype=dtype)
-    work = dist.irecv(tensor_grad, src=src, group=_pp_group(groups))
+    work = dist.irecv(
+        tensor_grad,
+        group=_pp_group(groups),
+        group_src=_pp_group_rank(groups, src),
+    )
     work.wait()
 
     return tensor_grad
