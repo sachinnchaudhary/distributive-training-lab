@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -174,6 +175,8 @@ class ExpertParallelMLP(nn.Module):
             original_num_tokens=tokens.shape[0],
             groups=self.groups,
         )
+        if _tp_is_active(self.groups) and _ep_is_active(self.groups):
+            dist.barrier(group=self.groups.tp_group)
         return combined.view(original_shape)
 
 
@@ -342,4 +345,3 @@ class MoETransformerPipelineStage(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.forward_local(x)
-
