@@ -48,7 +48,8 @@ def send_forward(tensor: torch.Tensor, groups: ParallelGroups) -> None:
     if dst is None:  
         return  
     
-    dist.send(tensor, dst=dst)  
+    work = dist.isend(tensor.contiguous(), dst=dst)  
+    work.wait()
 
 def recv_forward(
         shape: tuple[int, ...], 
@@ -64,7 +65,8 @@ def recv_forward(
         raise RuntimeError("first pipeline stage cannot receive forward activation") 
     
     tensor = torch.empty(shape, device=device, dtype=dtype)  
-    dist.recv(tensor, src=src)  
+    work = dist.irecv(tensor, src=src)  
+    work.wait()
 
     return tensor  
 
@@ -77,7 +79,8 @@ def send_backward(tensor_grad: torch.Tensor, groups: ParallelGroups) -> None:
     if dst is None:  
         return  
     
-    dist.send(tensor_grad, dst=dst) 
+    work = dist.isend(tensor_grad.contiguous(), dst=dst) 
+    work.wait()
 
 def recv_backward( 
     shape: tuple[int, ...], 
@@ -93,7 +96,8 @@ def recv_backward(
         raise RuntimeError("last pipeline stage cannot receive backward activation gradient")  
     
     tensor_grad = torch.empty(shape, device=device, dtype=dtype)  
-    dist.recv(tensor_grad, src=src)  
+    work = dist.irecv(tensor_grad, src=src)  
+    work.wait()
 
     return tensor_grad  
 
@@ -183,7 +187,8 @@ def send_virtual_forward(
     if dst is None:
         return
 
-    dist.send(tensor, dst=dst)
+    work = dist.isend(tensor.contiguous(), dst=dst)
+    work.wait()
 
 
 def recv_virtual_forward(
@@ -205,7 +210,8 @@ def recv_virtual_forward(
         )
 
     tensor = torch.empty(shape, device=device, dtype=dtype)
-    dist.recv(tensor, src=src)
+    work = dist.irecv(tensor, src=src)
+    work.wait()
 
     return tensor  
 
@@ -224,7 +230,8 @@ def send_virtual_backward(
     if dst is None:
         return
 
-    dist.send(tensor_grad, dst=dst)
+    work = dist.isend(tensor_grad.contiguous(), dst=dst)
+    work.wait()
 
 
 def recv_virtual_backward(
@@ -248,6 +255,7 @@ def recv_virtual_backward(
         )
 
     tensor_grad = torch.empty(shape, device=device, dtype=dtype)
-    dist.recv(tensor_grad, src=src)
+    work = dist.irecv(tensor_grad, src=src)
+    work.wait()
 
     return tensor_grad
