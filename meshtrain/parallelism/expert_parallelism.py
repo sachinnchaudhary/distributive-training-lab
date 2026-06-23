@@ -212,6 +212,8 @@ def _all_to_all_by_counts(
             tuple(recv_counts.tolist()),
             groups.ep_group,
             _ep_is_active(groups),
+            groups.rank,
+            tuple(groups.ep_ranks),
         )
 
     output_shape = (int(recv_counts.sum().item()), *send_tensor.shape[1:])
@@ -251,11 +253,15 @@ class _AllToAllByCounts(torch.autograd.Function):
         recv_counts: tuple[int, ...],
         group: dist.ProcessGroup | None,
         active: bool,
+        rank: int,
+        ep_ranks: tuple[int, ...],
     ) -> torch.Tensor:
         ctx.send_counts = send_counts
         ctx.recv_counts = recv_counts
         ctx.group = group
         ctx.active = active
+        ctx.rank = rank
+        ctx.ep_ranks = ep_ranks
 
         output_shape = (sum(recv_counts), *send_tensor.shape[1:])
         recv_tensor = torch.empty(
@@ -287,6 +293,14 @@ class _AllToAllByCounts(torch.autograd.Function):
         )
 
         if ctx.active:
+            if os.environ.get("MESHTRAIN_5D_DEBUG", "0") == "1":
+                print(
+                    f"rank={ctx.rank} ep_group={list(ctx.ep_ranks)} "
+                    "ep:tensor_all_to_all_backward_start "
+                    f"grad={tuple(grad_output.shape)} send={list(ctx.recv_counts)} "
+                    f"recv={list(ctx.send_counts)}",
+                    flush=True,
+                )
             dist.all_to_all_single(
                 grad_input,
                 grad_output.contiguous(),
@@ -294,10 +308,16 @@ class _AllToAllByCounts(torch.autograd.Function):
                 input_split_sizes=list(ctx.recv_counts),
                 group=ctx.group,
             )
+            if os.environ.get("MESHTRAIN_5D_DEBUG", "0") == "1":
+                print(
+                    f"rank={ctx.rank} ep_group={list(ctx.ep_ranks)} "
+                    f"ep:tensor_all_to_all_backward_done out={tuple(grad_input.shape)}",
+                    flush=True,
+                )
         else:
             grad_input.copy_(grad_output)
 
-        return grad_input, None, None, None, None
+        return grad_input, None, None, None, None, None, None
 
 
 def dispatch_tokens_to_experts(
