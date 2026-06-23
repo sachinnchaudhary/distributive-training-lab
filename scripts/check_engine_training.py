@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mode",
-        choices=["dp", "dp-pp", "pp-tp", "dp-pp-tp", "custom"],
+        choices=["dp", "dp-tp", "dp-pp", "pp-tp", "dp-pp-tp", "custom"],
         default="dp",
     )
     parser.add_argument("--dp", type=int, default=None)
@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--atol", type=float, default=1e-5)
+    parser.add_argument("--progress", action="store_true")
     return parser.parse_args()
 
 
@@ -66,6 +67,8 @@ def mode_dims(args: argparse.Namespace) -> tuple[int, int, int]:
 
     if args.mode == "dp":
         return args.dp or world_size, args.pp or 1, args.tp or 1
+    if args.mode == "dp-tp":
+        return args.dp or 4, args.pp or 1, args.tp or 2
     if args.mode == "dp-pp":
         return args.dp or 2, args.pp or 2, args.tp or 1
     if args.mode == "pp-tp":
@@ -138,6 +141,15 @@ def module_for_replica_check(trainer: EngineTrainer) -> torch.nn.Module:
     return trainer.model
 
 
+def progress(trainer: EngineTrainer, message: str, enabled: bool) -> None:
+    if not enabled:
+        return
+    if trainer.context is None:
+        print(f"rank=? {message}", flush=True)
+        return
+    print(f"rank={trainer.context.runtime.rank} {message}", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     config = build_config(args)
@@ -146,8 +158,10 @@ def main() -> None:
     losses: list[float] = []
 
     try:
+        progress(trainer, "setup:start", args.progress)
         trainer.setup()
         assert trainer.context is not None
+        progress(trainer, "setup:done", args.progress)
 
         runtime = trainer.context.runtime
         if runtime.world_size != config.parallelism.world_size:
@@ -157,16 +171,24 @@ def main() -> None:
             )
 
         for _ in range(args.steps):
+            progress(trainer, f"step:{trainer.state.step}:start", args.progress)
             metrics = trainer.train_step()
+            progress(
+                trainer,
+                f"step:{metrics.step}:done loss={metrics.loss:.6f}",
+                args.progress,
+            )
             if not math.isfinite(metrics.loss):
                 raise RuntimeError(f"non-finite loss at step {metrics.step}: {metrics.loss}")
             losses.append(metrics.loss)
 
+        progress(trainer, "replica_check:start", args.progress)
         replica_check = check_replicas_match(
             module_for_replica_check(trainer),
             trainer.context.groups,
             atol=args.atol,
         )
+        progress(trainer, "replica_check:done", args.progress)
 
         passed = replica_check.passed and all(math.isfinite(loss) for loss in losses)
         passed_tensor = torch.tensor(int(passed), device=runtime.device)
