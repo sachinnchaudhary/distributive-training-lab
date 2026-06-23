@@ -55,8 +55,15 @@ class _TensorParallelAllReduce(torch.autograd.Function):
         output = tensor.clone()
         if groups.tp_group is not None and len(groups.tp_ranks) > 1:
             _debug_tp(groups, f"all_reduce_forward_start shape={tuple(output.shape)}")
-            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=groups.tp_group)
-            _debug_tp(groups, "all_reduce_forward_done")
+            work = dist.all_reduce(
+                output,
+                op=dist.ReduceOp.SUM,
+                group=groups.tp_group,
+                async_op=True,
+            )
+            _debug_tp(groups, "all_reduce_forward_launched")
+            work.wait()
+            _debug_tp(groups, "all_reduce_forward_wait_done")
         return output
 
     @staticmethod
