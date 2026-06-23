@@ -1,8 +1,28 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Generated trace/log outputs
 meshtrain/core/logging/*.jsonl
-tmp/
+*.log
 
+# Local data and model artifacts
+data/
 data_downloads/
+checkpoints/
+tmp/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# Local environments and build outputs
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/

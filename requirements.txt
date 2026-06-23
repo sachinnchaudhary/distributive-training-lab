@@ -1,0 +1,5 @@
+torch
+numpy
+sentencepiece
+huggingface_hub
+tqdm

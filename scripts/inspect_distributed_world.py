@@ -206,33 +206,3 @@ if __name__ == "__main__":
 
     main()
 
-
-"""rank=5
-
-physical:
-  node=0
-  local_rank=5
-  device=demo:rank5
-
-logical:
-  dp=1
-  pp=0
-  tp=1
-  cp=0
-  ep=0
-
-groups:
-  dp_group=[1, 5]
-  pp_group=[5, 7]
-  tp_group=[4, 5]
-  cp_group=[5]
-  ep_group=[5]
-
-ownership:
-  data_shard=1
-  layer_stage=0
-  tensor_shard=1
-  layers=[0, 12)
-  batch=[512, 1024)
-  context=[0, 8192)
-  tensor_dim_1=[8192, 16384)""" 
