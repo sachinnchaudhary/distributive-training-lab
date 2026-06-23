@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 import torch.distributed as dist
@@ -39,21 +38,13 @@ def _slice_last_dim(tensor: torch.Tensor, groups: ParallelGroups) -> torch.Tenso
     return tensor[..., start:end]
 
 
-def _debug_tp(groups: ParallelGroups, message: str) -> None:
-    if os.environ.get("MESHTRAIN_5D_DEBUG", "0") != "1":
-        return
-    print(f"rank={groups.rank} tp_group={groups.tp_ranks} tp:{message}", flush=True)
-
-
 class _TensorParallelAllReduce(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tensor: torch.Tensor, groups: ParallelGroups) -> torch.Tensor:
         ctx.groups = groups
         output = tensor.clone()
         if groups.tp_group is not None and len(groups.tp_ranks) > 1:
-            _debug_tp(groups, f"all_reduce_forward_start shape={tuple(output.shape)}")
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=groups.tp_group)
-            _debug_tp(groups, "all_reduce_forward_done")
         return output
 
     @staticmethod

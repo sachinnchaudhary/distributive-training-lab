@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 
 from meshtrain.parallelism.pipeline_parallel.p2p import (
     recv_backward,
@@ -23,6 +24,18 @@ from meshtrain.parallelism.pipeline_parallel.stage import PipelineStage
 class PipelineMicrobatchState:
     input_activation: torch.Tensor
     output_activation: torch.Tensor
+
+
+def _stage_group_is_active(stage: PipelineStage) -> bool:
+    return (
+        stage.groups.stage_group is not None
+        and len(stage.groups.stage_ranks) > 1
+    )
+
+
+def _stage_barrier(stage: PipelineStage) -> None:
+    if _stage_group_is_active(stage):
+        dist.barrier(group=stage.groups.stage_group)
 
 
 def pipeline_forward(
@@ -172,6 +185,7 @@ def gpipe_forward_backward(
 
     losses: list[torch.Tensor] = []
     for microbatch_id in reversed(range(num_microbatches)):
+        _stage_barrier(stage)
         state = states[microbatch_id]
         x = state.input_activation
         y = state.output_activation
