@@ -3,13 +3,11 @@ from __future__ import annotations
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from meshtrain.core.distributed.collectives import (
-    all_gather_tensor_parallel,
-    all_reduce_tensor_parallel,
-)
+from meshtrain.core.distributed.collectives import all_gather_tensor_parallel
 from meshtrain.core.distributed.groups import ParallelGroups
 
 
@@ -38,6 +36,27 @@ def _slice_last_dim(tensor: torch.Tensor, groups: ParallelGroups) -> torch.Tenso
     start = tp_rank * local_dim
     end = start + local_dim
     return tensor[..., start:end]
+
+
+class _TensorParallelAllReduce(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, groups: ParallelGroups) -> torch.Tensor:
+        ctx.groups = groups
+        output = tensor.clone()
+        if groups.tp_group is not None and len(groups.tp_ranks) > 1:
+            dist.all_reduce(output, op=dist.ReduceOp.SUM, group=groups.tp_group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output, None
+
+
+def _all_reduce_tensor_parallel_autograd(
+    tensor: torch.Tensor,
+    groups: ParallelGroups,
+) -> torch.Tensor:
+    return _TensorParallelAllReduce.apply(tensor, groups)
 
 
 class ColumnParallelLinear(nn.Module):
@@ -158,10 +177,9 @@ class RowParallelLinear(nn.Module):
         local_input = x if self.input_is_parallel else _slice_last_dim(x, self.groups)
 
         partial_output = F.linear(local_input, self.weight, None)
-        output = all_reduce_tensor_parallel(
+        output = _all_reduce_tensor_parallel_autograd(
             partial_output,
             self.groups,
-            inplace=True,
         )
 
         if self.bias is not None:
