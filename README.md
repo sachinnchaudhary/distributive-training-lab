@@ -81,27 +81,52 @@ also files are not toy-only pseudocode. The implementation uses real PyTorch dis
 One example is collective tracing. Distributed training can feel invisible because an `all_reduce` or `all_gather` happens inside the runtime and then disappears. `core/distributed/collective_trace.py` makes the communication visible as structured JSONL. A trace event can show:
 
 ```text
+step
+microbatch
 rank
-collective name
-parallel axis
-input tensor shape
-output tensor shape
-dtype
-device
-before summary
-after summary
+coord
+layer
+module
+op
+axis
+group
+reason
+before
+after
 ```
 
 So instead of only saying "tensor parallel all-gather happened", the repo can record a readable event like:
 
 ```json
 {
-  "name": "all_gather_tensor_parallel",
-  "axis": "tp",
+  "step": 0,
+  "microbatch": 1,
   "rank": 1,
   "coord": {"dp": 0, "pp": 0, "tp": 1, "cp": 0, "ep": 0},
-  "before": {"shape": [2, 4, 16], "dtype": "torch.float32"},
-  "after": {"shape": [2, 4, 32], "dtype": "torch.float32"}
+  "layer": 3,
+  "module": "tensor_parallel_attention",
+  "op": "all_gather",
+  "axis": "tp",
+  "group": [0, 1],
+  "reason": "gather column-parallel output shards",
+  "before": {
+    "name": "local_output",
+    "meaning": "rank-local tensor-parallel shard",
+    "local_shape": [2, 4, 16],
+    "global_shape": [2, 4, 32],
+    "dtype": "torch.float32",
+    "device": "cuda:1",
+    "complete": false
+  },
+  "after": {
+    "name": "gathered_output",
+    "meaning": "complete tensor after tensor-parallel gather",
+    "local_shape": [2, 4, 32],
+    "global_shape": [2, 4, 32],
+    "dtype": "torch.float32",
+    "device": "cuda:1",
+    "complete": true
+  }
 }
 ```
 
