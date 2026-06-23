@@ -25,7 +25,12 @@ from meshtrain.engine.precision import (
     create_grad_scaler,
     maybe_cast_model,
 )
+from meshtrain.model.moe_transformer import (
+    MoETransformerLM,
+    MoETransformerPipelineStage,
+)
 from meshtrain.model.standard_transformer import TransformerLM
+from meshtrain.parallelism.context_parallelism import shard_sequence
 from meshtrain.parallelism.data_parallel.data_parallelism import (
     broadcast_parameters,
     sync_gradients,
@@ -100,14 +105,6 @@ class EngineTrainer:
     def _validate_supported_parallelism(self) -> None:
         parallelism = self.config.parallelism
 
-        if parallelism.cp != 1:
-            raise NotImplementedError(
-                "CP attention is implemented, but EngineTrainer CP wiring is not done yet"
-            )
-        if parallelism.ep != 1:
-            raise NotImplementedError(
-                "EP routing is implemented, but EngineTrainer EP wiring is not done yet"
-            )
         if parallelism.zero_stage != 0:
             raise NotImplementedError("ZeRO is not wired into EngineTrainer yet")
         if parallelism.fsdp:
@@ -172,19 +169,33 @@ class EngineTrainer:
     def _setup_pipeline(self) -> None:
         assert self.context is not None
 
-        stage = build_transformer_pipeline_stage(
-            self.config.model,
-            self.context.groups,
-        ).to(self.context.runtime.device)
+        if self._uses_moe_transformer:
+            stage = self._build_moe_pipeline_stage().to(self.context.runtime.device)
+        else:
+            stage = build_transformer_pipeline_stage(
+                self.config.model,
+                self.context.groups,
+            ).to(self.context.runtime.device)
         stage = maybe_cast_model(stage, self.config.precision)
 
         self.pipeline_stage = stage
         self.optimizer = self._build_optimizer(stage)
 
+    @property
+    def _uses_moe_transformer(self) -> bool:
+        parallelism = self.config.parallelism
+        return self.config.moe.enabled or parallelism.cp > 1 or parallelism.ep > 1
+
     def _build_model(self) -> nn.Module:
         assert self.context is not None
 
-        if self.config.parallelism.tp > 1:
+        if self._uses_moe_transformer:
+            model = MoETransformerLM(
+                self.config.model,
+                self.context.groups,
+                num_experts=self.config.moe.num_experts,
+            ).to(self.context.runtime.device)
+        elif self.config.parallelism.tp > 1:
             model = TensorParallelTransformerLM(
                 self.config.model,
                 self.context.groups,
@@ -198,6 +209,32 @@ class EngineTrainer:
             self.config.activation_checkpointing,
         )
         return model
+
+    def _build_moe_pipeline_stage(self) -> nn.Module:
+        assert self.context is not None
+
+        groups = self.context.groups
+        stage_index = groups.pp_ranks.index(groups.rank)
+        num_stages = len(groups.pp_ranks)
+
+        from meshtrain.core.distributed.placement import split_range
+
+        layer_range = split_range(
+            size=self.config.model.n_layers,
+            parts=num_stages,
+            index=stage_index,
+            require_even=False,
+        )
+
+        return MoETransformerPipelineStage(
+            self.config.model,
+            groups,
+            layer_start=layer_range.start,
+            layer_end=layer_range.end,
+            num_experts=self.config.moe.num_experts,
+            is_first=stage_index == 0,
+            is_last=stage_index == num_stages - 1,
+        )
 
     def _build_optimizer(self, model: nn.Module) -> torch.optim.Optimizer:
         optimizer_config = self.config.optimizer
@@ -239,6 +276,18 @@ class EngineTrainer:
             device=self.context.runtime.device,
         )
 
+    def _target_ids_for_loss(self, target_ids: torch.Tensor) -> torch.Tensor:
+        assert self.context is not None
+
+        if self.config.parallelism.cp == 1:
+            return target_ids
+
+        return shard_sequence(
+            target_ids,
+            self.context.groups,
+            seq_dim=1,
+        )
+
     def train_step(self) -> TrainMetrics:
         if self.uses_pipeline_parallel:
             return self._pipeline_gpipe_train_step()
@@ -268,7 +317,7 @@ class EngineTrainer:
             self._debug_step("single:forward_start")
             logits = self.model(batch.input_ids)
             self._debug_step("single:forward_done")
-            loss_out = next_token_loss(logits, batch.target_ids)
+            loss_out = next_token_loss(logits, self._target_ids_for_loss(batch.target_ids))
             self._debug_step("single:loss_done")
 
         self._debug_step("single:loss_stats_sync_start")
@@ -334,14 +383,22 @@ class EngineTrainer:
         target_microbatches = list(batch.target_ids.chunk(num_microbatches, dim=0))
 
         microbatch_size = input_microbatches[0].shape[0]
+        activation_seq_len = (
+            self.config.model.seq_len // self.config.parallelism.cp
+            if self.config.parallelism.cp > 1
+            else self.config.model.seq_len
+        )
         activation_shape = (
             microbatch_size,
-            self.config.model.seq_len,
+            activation_seq_len,
             self.config.model.dim,
         )
 
         def loss_fn(logits: torch.Tensor, microbatch_id: int) -> torch.Tensor:
-            loss_out = next_token_loss(logits, target_microbatches[microbatch_id])
+            loss_out = next_token_loss(
+                logits,
+                self._target_ids_for_loss(target_microbatches[microbatch_id]),
+            )
             return loss_out.loss / num_microbatches
 
         with autocast_context(

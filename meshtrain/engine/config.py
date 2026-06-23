@@ -172,6 +172,18 @@ class CheckpointConfig:
 
 
 @dataclass(frozen=True)
+class MoEConfig:
+    enabled: bool = False
+    num_experts: int = 1
+
+    def __post_init__(self) -> None:
+        if self.num_experts < 1:
+            raise ValueError("num_experts must be >= 1")
+        if self.enabled and self.num_experts < 2:
+            raise ValueError("enabled MoE requires num_experts >= 2")
+
+
+@dataclass(frozen=True)
 class EngineConfig:
     parallelism: ParallelismConfig
     model: TransformerConfig
@@ -181,6 +193,7 @@ class EngineConfig:
     precision: PrecisionConfig = PrecisionConfig()
     activation_checkpointing: ActivationCheckpointConfig = ActivationCheckpointConfig()
     checkpoint: CheckpointConfig = CheckpointConfig()
+    moe: MoEConfig = MoEConfig()
 
     def validate(self, *, world_size: int | None = None) -> None:
         parallelism = self.parallelism
@@ -201,6 +214,12 @@ class EngineConfig:
 
         if model.seq_len % parallelism.cp != 0:
             raise ValueError("model seq_len must be divisible by cp")
+
+        if self.moe.enabled and self.moe.num_experts % parallelism.ep != 0:
+            raise ValueError("num_experts must be divisible by ep")
+
+        if parallelism.ep > 1 and not self.moe.enabled:
+            raise ValueError("ep > 1 requires moe.enabled=True")
 
         if self.data.seq_len != model.seq_len:
             raise ValueError("data seq_len must match model seq_len")
