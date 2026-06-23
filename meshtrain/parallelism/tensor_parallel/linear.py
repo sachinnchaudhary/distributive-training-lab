@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.distributed as dist
@@ -38,13 +39,24 @@ def _slice_last_dim(tensor: torch.Tensor, groups: ParallelGroups) -> torch.Tenso
     return tensor[..., start:end]
 
 
+def _debug_tp(groups: ParallelGroups, message: str) -> None:
+    if os.environ.get("MESHTRAIN_TP_DEBUG", "0") != "1":
+        return
+    print(
+        f"rank={groups.rank} tp_group={groups.tp_ranks} tp:{message}",
+        flush=True,
+    )
+
+
 class _TensorParallelAllReduce(torch.autograd.Function):
     @staticmethod
     def forward(ctx, tensor: torch.Tensor, groups: ParallelGroups) -> torch.Tensor:
         ctx.groups = groups
         output = tensor.clone()
         if groups.tp_group is not None and len(groups.tp_ranks) > 1:
+            _debug_tp(groups, f"all_reduce_forward_start shape={tuple(output.shape)}")
             dist.all_reduce(output, op=dist.ReduceOp.SUM, group=groups.tp_group)
+            _debug_tp(groups, "all_reduce_forward_done")
         return output
 
     @staticmethod
@@ -103,7 +115,12 @@ class ColumnParallelLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _debug_tp(
+            self.groups,
+            f"column_linear_start in={self.in_features} out={self.out_features} shape={tuple(x.shape)}",
+        )
         local_output = F.linear(x, self.weight, self.bias)
+        _debug_tp(self.groups, f"column_linear_done shape={tuple(local_output.shape)}")
 
         if self.gather_output:
             return all_gather_tensor_parallel(
@@ -174,13 +191,19 @@ class RowParallelLinear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _debug_tp(
+            self.groups,
+            f"row_linear_start in={self.in_features} out={self.out_features} shape={tuple(x.shape)}",
+        )
         local_input = x if self.input_is_parallel else _slice_last_dim(x, self.groups)
 
         partial_output = F.linear(local_input, self.weight, None)
+        _debug_tp(self.groups, f"row_linear_partial_done shape={tuple(partial_output.shape)}")
         output = _all_reduce_tensor_parallel_autograd(
             partial_output,
             self.groups,
         )
+        _debug_tp(self.groups, f"row_linear_done shape={tuple(output.shape)}")
 
         if self.bias is not None:
             output = output + self.bias
