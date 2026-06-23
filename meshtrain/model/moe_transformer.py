@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import torch.distributed as dist
@@ -40,6 +41,12 @@ def _cp_is_active(groups: ParallelGroups) -> bool:
 
 def _ep_is_active(groups: ParallelGroups) -> bool:
     return groups.ep_group is not None and len(groups.ep_ranks) > 1
+
+
+def _debug_moe(groups: ParallelGroups, message: str) -> None:
+    if os.environ.get("MESHTRAIN_5D_DEBUG", "0") != "1":
+        return
+    print(f"rank={groups.rank} tp_group={groups.tp_ranks} moe:{message}", flush=True)
 
 
 class CPEnabledSelfAttention(nn.Module):
@@ -176,7 +183,10 @@ class ExpertParallelMLP(nn.Module):
             groups=self.groups,
         )
         if _tp_is_active(self.groups) and _ep_is_active(self.groups):
-            dist.barrier(group=self.groups.tp_group)
+            _debug_moe(self.groups, "tp_barrier_after_ep_start")
+            with torch.no_grad():
+                dist.barrier(group=self.groups.tp_group)
+            _debug_moe(self.groups, "tp_barrier_after_ep_done")
         return combined.view(original_shape)
 
 
